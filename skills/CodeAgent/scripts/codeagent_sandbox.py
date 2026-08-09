@@ -2,9 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 CodeAgent 沙箱执行环境
-功能：在隔离环境中执行代码，限制 CPU、内存、网络、文件系统、运行时间
 作者: Evo
-日期: 2026-08-07
+日期: 2026-08-09
 路径：./scripts/codeagent_sandbox.py
 """
 
@@ -16,11 +15,19 @@ import signal
 import subprocess
 import time
 import shutil
-import tempfile
 import re
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 from dataclasses import dataclass, field
+
+try:
+    from RestrictedPython import safe_builtins
+    from RestrictedPython import compile_restricted
+    from RestrictedPython import limited_builtins
+    RESTRICTED_PYTHON_AVAILABLE = True
+except ImportError:
+    RESTRICTED_PYTHON_AVAILABLE = False
+
 
 @dataclass
 class SandboxConfig:
@@ -42,6 +49,8 @@ class SandboxConfig:
     encoding: str = 'utf-8'
     max_files: int = 50
     max_subprocesses: int = 5
+    use_restricted_python: bool = True
+
 
 class ResourceLimiter:
     def __init__(self, config: SandboxConfig):
@@ -60,6 +69,7 @@ class ResourceLimiter:
             resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
         except Exception:
             pass
+
 
 class TimeoutManager:
     def __init__(self, timeout_seconds: int):
@@ -81,45 +91,189 @@ class TimeoutManager:
             signal.signal(signal.SIGALRM, self._old_handler)
         return False
 
-class SandboxExecutor:
-    DANGEROUS_PATTERNS = [
-        (r'os\.remove\s*\(', '文件删除'),
-        (r'shutil\.rmtree\s*\(', '递归删除'),
-        (r'os\.unlink\s*\(', '文件删除'),
-        (r'subprocess\.(call|Popen|run|check_output)\s*\(', '子进程调用'),
-        (r'os\.system\s*\(', '系统命令执行'),
-        (r'eval\s*\(', 'eval执行'),
-        (r'exec\s*\(', 'exec执行'),
-        (r'__import__\s*\(', '动态导入'),
-        (r'compile\s*\(', '代码编译'),
-        (r'rm\s+-rf\s*/', '危险shell'),
-        (r'dd\s+if=', '危险shell'),
-        (r'mkfs\s+', '危险shell'),
-        (r':\(\)\{\s*:\|:&\s*\};:', 'fork炸弹'),
-        (r'base64\.b64decode\s*\(', 'base64解码'),
-        (r'ctypes\.(CDLL|windll|LibraryLoader)', 'ctypes调用'),
-        (r'open\s*\(\s*[\'"]/etc/', '敏感文件'),
-        (r'open\s*\(\s*[\'"]/root/', '敏感文件'),
-        (r'open\s*\(\s*[\'"]/sys/', '敏感文件'),
-        (r'open\s*\(\s*[\'"]/proc/', '敏感文件'),
-        (r'socket\.(socket|create_connection|connect)', '网络操作'),
-    ]
+
+class RestrictedPythonExecutor:
     
-    def __init__(self, config: SandboxConfig = None):
-        self.config = config or SandboxConfig()
-        self.workspace = Path(self.config.workspace_root).resolve()
-        self.workspace.mkdir(parents=True, exist_ok=True)
-        self._temp_dirs = []
+    def __init__(self, config: SandboxConfig):
+        self.config = config
+        self._setup_safe_env()
     
-    def _get_session_workspace(self, session_id: str) -> Path:
-        safe_id = re.sub(r'[^a-zA-Z0-9_-]', '_', session_id)
-        session_dir = self.workspace / safe_id
-        session_dir.mkdir(parents=True, exist_ok=True)
-        return session_dir
+    def _setup_safe_env(self):
+        self.safe_builtins = safe_builtins.copy() if RESTRICTED_PYTHON_AVAILABLE else {}
+        
+        safe_modules = {
+            'sys': sys,
+            'os': os,
+            're': re,
+            'json': json,
+            'time': time,
+            'datetime': __import__('datetime'),
+            'math': __import__('math'),
+            'random': __import__('random'),
+            'collections': __import__('collections'),
+            'itertools': __import__('itertools'),
+            'functools': __import__('functools'),
+            'typing': __import__('typing'),
+            'pathlib': Path,
+        }
+        
+        for name, module in safe_modules.items():
+            self.safe_builtins[name] = module
+        
+        self.safe_builtins['__import__'] = self._safe_import
+        self.safe_builtins['open'] = self._safe_open
+        self.safe_builtins['print'] = self._safe_print
+    
+    def _safe_import(self, name: str, *args, **kwargs):
+        safe_modules = {
+            'sys': sys, 'os': os, 're': re, 'json': json, 'time': time,
+            'datetime': __import__('datetime'), 'math': __import__('math'),
+            'random': __import__('random'), 'collections': __import__('collections'),
+            'itertools': __import__('itertools'), 'functools': __import__('functools'),
+            'typing': __import__('typing'), 'pathlib': Path,
+        }
+        if name in safe_modules:
+            return safe_modules[name]
+        if name in ['pytest', 'unittest', 'doctest']:
+            raise ImportError(f"测试模块 {name} 不允许在沙箱中导入")
+        raise ImportError(f"模块 {name} 不允许在沙箱中导入")
+    
+    def _safe_open(self, path: str, mode: str = 'r', *args, **kwargs):
+        if not self.config.allow_write and 'w' in mode:
+            raise PermissionError(f"写入被禁止: {path}")
+        if not self.config.allow_read and 'r' in mode:
+            raise PermissionError(f"读取被禁止: {path}")
+        if self.config.allow_delete and any(k in path for k in ['rm', 'del', 'remove']):
+            raise PermissionError(f"删除被禁止: {path}")
+        if path.startswith('/etc/') or path.startswith('/root/') or path.startswith('/sys/') or path.startswith('/proc/'):
+            raise PermissionError(f"系统路径访问被禁止: {path}")
+        return open(path, mode, *args, **kwargs)
+    
+    def _safe_print(self, *args, **kwargs):
+        output = ' '.join(str(arg) for arg in args)
+        sys.stdout.write(output + '\n')
+        sys.stdout.flush()
+    
+    def execute_code(self, code: str, session_dir: Path, filename: str = 'main.py') -> Tuple[str, str, int]:
+        if not RESTRICTED_PYTHON_AVAILABLE:
+            return "", "RestrictedPython 未安装，请运行: pip install RestrictedPython", -1
+        
+        try:
+            compiled_code = compile_restricted(code, filename, 'exec')
+        except SyntaxError as e:
+            return "", f"语法错误: {e}", -1
+        except Exception as e:
+            return "", f"编译错误: {e}", -1
+        
+        old_cwd = os.getcwd()
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
+        old_stdin = sys.stdin
+        
+        stdout_capture = []
+        stderr_capture = []
+        
+        class CaptureIO:
+            def __init__(self, capture_list):
+                self.capture_list = capture_list
+            
+            def write(self, text):
+                self.capture_list.append(text)
+            
+            def flush(self):
+                pass
+        
+        sys.stdout = CaptureIO(stdout_capture)
+        sys.stderr = CaptureIO(stderr_capture)
+        sys.stdin = open(os.devnull, 'r')
+        
+        try:
+            os.chdir(str(session_dir))
+            
+            safe_globals = {
+                '__builtins__': self.safe_builtins,
+                '__name__': '__main__',
+                '__file__': filename,
+                'Path': Path,
+                'sys': sys,
+                'os': os,
+                're': re,
+                'json': json,
+                'time': time,
+                'math': __import__('math'),
+                'random': __import__('random'),
+            }
+            
+            exec(compiled_code, safe_globals)
+            exit_code = 0
+            
+        except SystemExit as e:
+            exit_code = e.code if isinstance(e.code, int) else 0
+        except Exception as e:
+            stderr_capture.append(f"{type(e).__name__}: {e}\n")
+            exit_code = 1
+        finally:
+            os.chdir(old_cwd)
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+            sys.stdin = old_stdin
+        
+        return ''.join(stdout_capture), ''.join(stderr_capture), exit_code
+
+
+class StandardExecutor:
+    
+    def __init__(self, config: SandboxConfig):
+        self.config = config
+    
+    def execute_code(self, code: str, session_dir: Path, language: str, filename: str, args: list = None) -> Tuple[str, str, int, float]:
+        file_path = session_dir / filename
+        
+        if language == 'python':
+            cmd = ['python3', '-u', str(file_path)] + (args or [])
+        elif language == 'javascript':
+            cmd = ['node', str(file_path)] + (args or [])
+        elif language == 'bash':
+            os.chmod(file_path, 0o755)
+            cmd = ['bash', str(file_path)] + (args or [])
+        else:
+            return "", f"不支持的语言: {language}", -1, 0
+        
+        start_time = time.time()
+        
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(session_dir),
+                env=self._build_env(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding=self.config.encoding,
+                preexec_fn=os.setsid if hasattr(os, 'setsid') else None
+            )
+            
+            try:
+                stdout, stderr = proc.communicate(timeout=self.config.wall_time_limit)
+                stdout = stdout[:100000] if len(stdout) > 100000 else stdout
+                stderr = stderr[:50000] if len(stderr) > 50000 else stderr
+                if len(stdout) > 100000:
+                    stdout += f"\n... (输出截断，共 {len(stdout)} 字符)"
+                return stdout, stderr, proc.returncode, time.time() - start_time
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except:
+                    proc.kill()
+                proc.wait(timeout=2)
+                return "", f"执行超时（{self.config.wall_time_limit}秒）", -1, time.time() - start_time
+                
+        except Exception as e:
+            return "", f"执行异常: {e}", -1, time.time() - start_time
     
     def _build_env(self) -> Dict[str, str]:
         env = os.environ.copy()
-        env['TMPDIR'] = str(self.workspace / 'tmp')
+        env['TMPDIR'] = str(self.config.workspace_root / 'tmp')
         env['TEMP'] = env['TMPDIR']
         env['TMP'] = env['TMPDIR']
         env['PYTHONDONTWRITEBYTECODE'] = '1'
@@ -131,38 +285,31 @@ class SandboxExecutor:
             env['no_proxy'] = '*'
         env['PATH'] = '/usr/local/bin:/usr/bin:/bin'
         return env
+
+
+class SandboxExecutor:
     
-    def _check_security(self, code: str) -> Tuple[bool, str, Optional[int]]:
-        lines = code.split('\n')
-        for i, line in enumerate(lines, 1):
-            stripped = line.strip()
-            if stripped.startswith('#'):
-                continue
-            for pattern, msg in self.DANGEROUS_PATTERNS:
-                if re.search(pattern, line, re.IGNORECASE):
-                    return False, f"{msg} (行 {i})", i
-        return True, "通过", None
+    def __init__(self, config: SandboxConfig = None):
+        self.config = config or SandboxConfig()
+        self.workspace = Path(self.config.workspace_root).resolve()
+        self.workspace.mkdir(parents=True, exist_ok=True)
+        
+        self.restricted_executor = RestrictedPythonExecutor(self.config) if self.config.use_restricted_python else None
+        self.standard_executor = StandardExecutor(self.config)
     
-    def _check_file_operation(self, path: str) -> Tuple[bool, str]:
-        if not self.config.allow_write and ('w' in path or 'write' in path):
-            return False, "写入被禁止"
-        if not self.config.allow_delete and any(k in path for k in ['rm', 'del', 'remove']):
-            return False, "删除被禁止"
-        return True, "允许"
+    def _get_session_workspace(self, session_id: str) -> Path:
+        safe_id = re.sub(r'[^a-zA-Z0-9_-]', '_', session_id)
+        session_dir = self.workspace / safe_id
+        session_dir.mkdir(parents=True, exist_ok=True)
+        return session_dir
     
     def execute(self, code: str, session_id: str, language: str = 'python',
                 filename: str = 'main.py', args: list = None) -> Dict[str, Any]:
         result = {
             'success': False, 'stdout': '', 'stderr': '', 'exit_code': -1,
             'time_elapsed': 0, 'files': [], 'error': None, 'security_warning': None,
-            'resource_usage': {}
+            'execution_method': 'standard'
         }
-        
-        safe, warning, line = self._check_security(code)
-        if not safe:
-            result['security_warning'] = warning
-            result['error'] = f"安全拦截: {warning}"
-            return result
         
         session_dir = self._get_session_workspace(session_id)
         file_path = session_dir / filename
@@ -173,51 +320,35 @@ class SandboxExecutor:
             result['error'] = f"写入文件失败: {e}"
             return result
         
-        if language == 'python':
-            cmd = ['python3', '-u', str(file_path)] + (args or [])
-        elif language == 'javascript':
-            cmd = ['node', str(file_path)] + (args or [])
-        elif language == 'bash':
-            os.chmod(file_path, 0o755)
-            cmd = ['bash', str(file_path)] + (args or [])
-        else:
-            result['error'] = f"不支持的语言: {language}"
-            return result
+        limiter = ResourceLimiter(self.config)
+        limiter.apply_limits()
         
-        env = self._build_env()
-        start_time = time.time()
+        stdout = ''
+        stderr = ''
+        exit_code = -1
+        time_elapsed = 0
         
         try:
-            limiter = ResourceLimiter(self.config)
-            limiter.apply_limits()
-            
             with TimeoutManager(self.config.wall_time_limit):
-                proc = subprocess.Popen(
-                    cmd,
-                    cwd=str(session_dir),
-                    env=env,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding=self.config.encoding,
-                    preexec_fn=os.setsid if hasattr(os, 'setsid') else None
-                )
+                if language == 'python' and self.config.use_restricted_python and RESTRICTED_PYTHON_AVAILABLE:
+                    stdout, stderr, exit_code = self.restricted_executor.execute_code(code, session_dir, filename)
+                    result['execution_method'] = 'restricted_python'
+                else:
+                    if language != 'python' or not RESTRICTED_PYTHON_AVAILABLE:
+                        stdout, stderr, exit_code, time_elapsed = self.standard_executor.execute_code(
+                            code, session_dir, language, filename, args
+                        )
+                    else:
+                        stdout, stderr, exit_code, time_elapsed = self.standard_executor.execute_code(
+                            code, session_dir, 'python', filename, args
+                        )
                 
-                try:
-                    stdout, stderr = proc.communicate(timeout=self.config.wall_time_limit)
-                    result['stdout'] = stdout[:100000] if len(stdout) > 100000 else stdout
-                    result['stderr'] = stderr[:50000] if len(stderr) > 50000 else stderr
-                    if len(stdout) > 100000:
-                        result['stdout'] += f"\n... (输出截断，共 {len(stdout)} 字符)"
-                    result['exit_code'] = proc.returncode
-                except subprocess.TimeoutExpired:
-                    try:
-                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                    except:
-                        proc.kill()
-                    proc.wait(timeout=2)
-                    result['error'] = f"执行超时（{self.config.wall_time_limit}秒）"
-                    return result
+                result['stdout'] = stdout[:100000] if len(stdout) > 100000 else stdout
+                result['stderr'] = stderr[:50000] if len(stderr) > 50000 else stderr
+                if len(stdout) > 100000:
+                    result['stdout'] += f"\n... (输出截断，共 {len(stdout)} 字符)"
+                result['exit_code'] = exit_code
+                result['time_elapsed'] = time_elapsed or 0
                 
         except TimeoutError as e:
             result['error'] = str(e)
@@ -247,10 +378,10 @@ class SandboxExecutor:
         except Exception as e:
             result['warning'] = f"文件收集失败: {e}"
         
-        result['time_elapsed'] = time.time() - start_time
         result['success'] = (result['exit_code'] == 0 and result['error'] is None)
         
         return result
+
 
 def main():
     import argparse
@@ -267,17 +398,19 @@ def main():
     args = parser.parse_args()
     
     if args.test:
-        print("🧪 运行沙箱测试...")
+        print("运行沙箱测试...")
         config = SandboxConfig()
         executor = SandboxExecutor(config)
         
         test_code = '''
 import os
+import sys
 print("Hello from sandbox!")
 print(f"当前目录: {os.getcwd()}")
 with open("test_output.txt", "w") as f:
     f.write("Test file created\\n")
 print("测试完成")
+print(f"Python版本: {sys.version}")
 '''
         result = executor.execute(
             code=test_code,
@@ -292,7 +425,7 @@ print("测试完成")
             print(f"生成的文件: {[f['name'] for f in result['files']]}")
         if result['error']:
             print(f"错误: {result['error']}")
-        print("✅ 测试完成")
+        print("测试完成")
         return
     
     if args.code:
@@ -321,6 +454,7 @@ print("测试完成")
         args=args.args
     )
     print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+
 
 if __name__ == '__main__':
     main()
